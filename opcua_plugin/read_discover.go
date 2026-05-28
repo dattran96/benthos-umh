@@ -429,6 +429,52 @@ func (g *OPCUAInput) decideDataChangeFilterSupport() (bool, bool) {
 	}
 }
 
+// isSkippableSubscriptionError reports whether a per-node BAD status code is
+// permanent for that specific node and therefore not worth recovering from by
+// tearing down the OPC UA session.
+//
+// When the server returns one of these codes for a single monitored item, the
+// node will fail identically on any reconnect, so the only useful response is
+// to drop that one node from the subscription and keep monitoring the rest of
+// the batch. Closing the client instead causes the whole input to flap into a
+// reconnect loop because of one mis-permissioned or malformed tag.
+//
+// Cases covered:
+//   - StatusBadNotReadable / StatusBadUserAccessDenied: AccessLevel lacks
+//     CurrentRead, or server-side ACL forbids the user from reading this node.
+//     Common on PLC retain/internal tags that are write-only by design.
+//   - StatusBadNodeIDUnknown / StatusBadNodeIDInvalid /
+//     StatusBadAttributeIDInvalid: The node was deleted, never existed, or
+//     does not expose AttributeIDValue.
+//   - StatusBadTypeMismatch / StatusBadIndexRangeInvalid /
+//     StatusBadIndexRangeNoData: Per-node data-model mismatch the runtime
+//     cannot fix.
+//   - StatusBadMonitoredItemFilterInvalid /
+//     StatusBadMonitoredItemFilterUnsupported: Per-node filter limitation,
+//     distinct from the connection-wide StatusBadFilterNotAllowed that the
+//     trial-and-retry logic in MonitorBatched already handles.
+//
+// Session/transport codes (BadSessionClosed, BadServerNotConnected, etc.) are
+// intentionally NOT in this list so they keep falling through to the existing
+// "close and reconnect" path.
+func isSkippableSubscriptionError(code ua.StatusCode) bool {
+	switch code {
+	case ua.StatusBadNotReadable,
+		ua.StatusBadUserAccessDenied,
+		ua.StatusBadNodeIDUnknown,
+		ua.StatusBadNodeIDInvalid,
+		ua.StatusBadAttributeIDInvalid,
+		ua.StatusBadTypeMismatch,
+		ua.StatusBadIndexRangeInvalid,
+		ua.StatusBadIndexRangeNoData,
+		ua.StatusBadMonitoredItemFilterInvalid,
+		ua.StatusBadMonitoredItemFilterUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
 // MonitorBatched splits the nodes into manageable batches and starts monitoring them.
 // This approach prevents the server from returning BadTcpMessageTooLarge by avoiding oversized monitoring requests.
 //
@@ -603,6 +649,7 @@ func (g *OPCUAInput) MonitorBatched(ctx context.Context, nodes []NodeDef) (int, 
 			return totalMonitored, errors.New("received nil response from Monitor")
 		}
 
+		skippedInBatch := 0
 		for i, result := range response.Results {
 			// Treat only BAD severity as a subscription failure; GOOD variants
 			// (e.g. GoodClamped) and UNCERTAIN codes still indicate the monitored
@@ -652,12 +699,26 @@ func (g *OPCUAInput) MonitorBatched(ctx context.Context, nodes []NodeDef) (int, 
 					return g.MonitorBatched(ctx, nodes[failedNodeIndex:])
 				}
 
+				// Per-node permanent errors (e.g. StatusBadNotReadable on a
+				// write-only PLC tag, StatusBadUserAccessDenied on a
+				// permission-restricted node, StatusBadNodeIDUnknown for a
+				// deleted node) cannot be recovered by tearing down the
+				// session and reconnecting - they will fail identically every
+				// time. Drop the offending node from the subscription and
+				// keep monitoring the rest of the batch so a single
+				// mis-permissioned tag does not stop the whole input.
+				if isSkippableSubscriptionError(result.StatusCode) {
+					RecordSubscriptionFailure(result.StatusCode, failedNode)
+					g.Log.Warnf("Skipping node %s: subscription rejected with %v. The node will not produce data; remaining nodes continue to be monitored.",
+						failedNode, result.StatusCode)
+					skippedInBatch++
+					continue
+				}
+
 				// Non-trial error or different error code - propagate normally
 				RecordSubscriptionFailure(result.StatusCode, failedNode)
 
 				g.Log.Errorf("Failed to monitor node %s: %v", failedNode, result.StatusCode)
-				// Depending on requirements, you might choose to continue monitoring other nodes
-				// instead of aborting. Here, we abort on the first failure.
 				// g.Log.Debugf("MonitoredItem OK ns=%d;id=%s -> revisedSampling=%.0fms revisedQueue=%d itemID=%d",
 				//	batch[i].NodeID.Namespace(), batch[i].NodeID.String(),
 				//	result.RevisedSamplingInterval, result.RevisedQueueSize, result.MonitoredItemID)
@@ -668,16 +729,23 @@ func (g *OPCUAInput) MonitorBatched(ctx context.Context, nodes []NodeDef) (int, 
 			}
 		}
 
-		// After successful batch processing, mark trial success if this was a trial
+		// After successful batch processing, mark trial success if this was a trial.
+		// "Success" here means no BadFilterNotAllowed - per-node skips are unrelated
+		// to filter capability, so a batch with only skip-class failures still
+		// confirms that filtering itself works.
 		if shouldTrial && g.ServerCapabilities != nil {
 			g.ServerCapabilities.hasTrialedThisConnection = true
 			g.ServerCapabilities.SupportsDataChangeFilter = true
 			g.Log.Infof("DataChangeFilter trial succeeded. Server supports filter - capability confirmed and cached for this connection.")
 		}
 
-		monitoredNodes := len(response.Results)
+		monitoredNodes := len(response.Results) - skippedInBatch
 		totalMonitored += monitoredNodes
-		g.Log.Infof("Successfully monitored %d nodes in current batch", monitoredNodes)
+		if skippedInBatch > 0 {
+			g.Log.Infof("Successfully monitored %d nodes in current batch (skipped %d node(s) with non-recoverable per-node errors)", monitoredNodes, skippedInBatch)
+		} else {
+			g.Log.Infof("Successfully monitored %d nodes in current batch", monitoredNodes)
+		}
 		if g.DeadbandType != "none" {
 			g.Log.Infof("Batch %d-%d: Applied %s deadband filter to %d numeric nodes (threshold: %.2f)",
 				batchRange.Start, batchRange.End-1, g.DeadbandType, numFilteredNodes, g.DeadbandValue)
